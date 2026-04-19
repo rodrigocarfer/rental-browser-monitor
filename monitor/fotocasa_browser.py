@@ -1,0 +1,414 @@
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Iterable
+from urllib.parse import urljoin, urlparse
+
+from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
+
+from monitor.idealista_browser import BrowserConfig, ensure_playwright_node_driver_env
+from monitor.models import Listing
+
+
+_FOTOCASA_DETAIL_RE = re.compile(r"^/es/alquiler/.*?/(\d+)/d(?:/|$)", re.IGNORECASE)
+# Detail URLs are usually /es/alquiler/<tipo>/<zona>/<slug>/<id>/d — also embedded in JSON as \"\/es\/alquiler\/...\"
+_FOTOCASA_DETAIL_PATH_IN_MARKUP_RE = re.compile(
+    r"/es/alquiler/[^/]+/[^/]+/[^/]+/\d{6,}/d",
+    re.IGNORECASE,
+)
+_BOT_RE = re.compile(r"captcha|datadome|perimeterx|px-captcha|recaptcha|hcaptcha", re.IGNORECASE)
+
+
+def _normalize_fotocasa_url(*, base_url: str, href: str) -> str | None:
+    if not href:
+        return None
+    if href.startswith("javascript:") or href.startswith("#"):
+        return None
+
+    absolute = urljoin(base_url, href)
+    p = urlparse(absolute)
+    if not p.scheme.startswith("http"):
+        return None
+
+    host = (p.netloc or "").lower()
+    if "fotocasa." not in host:
+        return None
+
+    path = p.path or ""
+    m = _FOTOCASA_DETAIL_RE.match(path)
+    if not m:
+        return None
+
+    listing_id = m.group(1)
+    cut = path.lower().rfind(f"/{listing_id}/d")
+    if cut < 0:
+        return None
+
+    canonical_path = path[: cut + len(f"/{listing_id}/d")]
+    return f"{p.scheme}://{p.netloc}{canonical_path}"
+
+
+def _detail_paths_from_markup(html: str) -> list[str]:
+    """
+    Fotocasa often exposes every result card in embedded JSON (e.g. Next.js props) while only some
+    cards have a traditional <a href=".../id/d"> in the live DOM. Scanning the full HTML catches
+    those listings without relying on lazy-loaded anchors.
+    """
+    if not html:
+        return []
+    text = html.replace("\\/", "/")
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in _FOTOCASA_DETAIL_PATH_IN_MARKUP_RE.finditer(text):
+        path = m.group(0)
+        if path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+    return out
+
+
+def _click_if_visible(page: Page, selectors: Iterable[str], *, timeout_ms: int = 1200) -> bool:
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            if loc.count() < 1:
+                continue
+            if not loc.first.is_visible():
+                continue
+            loc.first.click(timeout=timeout_ms)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _handle_consent(page: Page) -> None:
+    selectors = [
+        'button:has-text("Aceptar")',
+        'button:has-text("Acepto")',
+        'button:has-text("Aceptar y cerrar")',
+        'button:has-text("Aceptar todo")',
+        'button:has-text("Aceptar todas")',
+        'button[aria-label*="Aceptar"]',
+        '[id*="didomi"] button:has-text("Aceptar")',
+        '[class*="didomi"] button:has-text("Aceptar")',
+        '[id*="onetrust"] button:has-text("Aceptar")',
+        '[class*="onetrust"] button:has-text("Aceptar")',
+    ]
+
+    if _click_if_visible(page, selectors):
+        return
+
+    try:
+        for fr in page.frames:
+            if fr == page.main_frame:
+                continue
+            try:
+                for sel in selectors:
+                    loc = fr.locator(sel)
+                    if loc.count() < 1:
+                        continue
+                    if not loc.first.is_visible():
+                        continue
+                    loc.first.click(timeout=1200)
+                    return
+            except Exception:
+                continue
+    except Exception:
+        return
+
+
+def _is_bot_challenge(page: Page) -> bool:
+    try:
+        html = page.content()
+    except Exception:
+        return False
+    return bool(_BOT_RE.search(html))
+
+
+def _extract_listings_from_page(page: Page, *, source_name: str) -> list[Listing]:
+    base_url = page.url
+    items: dict[str, Listing] = {}
+
+    try:
+        html = page.content()
+    except Exception:
+        html = ""
+
+    anchors = page.locator('a[href*="/es/alquiler/"]')
+    n = anchors.count()
+    for i in range(n):
+        a = anchors.nth(i)
+        href = (a.get_attribute("href") or "").strip()
+        url = _normalize_fotocasa_url(base_url=base_url, href=href)
+        if not url:
+            continue
+
+        title = (a.get_attribute("title") or "").strip()
+        if not title:
+            title = (a.get_attribute("aria-label") or "").strip()
+        if not title:
+            try:
+                title = (a.inner_text() or "").strip()
+            except Exception:
+                title = ""
+        title = re.sub(r"\s+", " ", title).strip()
+        if not title:
+            title = f"Fotocasa {url.rsplit('/', 2)[-2]}"
+
+        items[url] = Listing(source_name=source_name, url=url, title=title[:500])
+
+    for path in _detail_paths_from_markup(html):
+        url = _normalize_fotocasa_url(base_url=base_url, href=path)
+        if not url or url in items:
+            continue
+        items[url] = Listing(
+            source_name=source_name,
+            url=url,
+            title=f"Fotocasa {url.rsplit('/', 2)[-2]}"[:500],
+        )
+
+    return list(items.values())
+
+
+def _wait_for_results(page: Page) -> None:
+    # Fotocasa often hydrates results client-side; wait for some detail links to exist.
+    try:
+        page.wait_for_selector('a[href*="/es/alquiler/"][href*="/d"]', timeout=25_000)
+    except PlaywrightTimeoutError:
+        pass
+
+
+def _scroll_results_until_stable(page: Page, *, max_scrolls: int = 20) -> None:
+    """
+    Fotocasa frequently lazy-loads additional cards on scroll. We scroll until the number
+    of detail anchors stops increasing for a few iterations (or we hit max_scrolls).
+    """
+    stable_rounds = 0
+    last_count = -1
+
+    for _ in range(max(1, int(max_scrolls))):
+        _handle_consent(page)
+        try:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        except Exception:
+            break
+
+        try:
+            page.wait_for_timeout(800)
+        except Exception:
+            pass
+
+        try:
+            page.wait_for_load_state("networkidle", timeout=5_000)
+        except PlaywrightTimeoutError:
+            pass
+
+        try:
+            count = page.locator('a[href*="/es/alquiler/"][href*="/d"]').count()
+        except Exception:
+            count = last_count
+
+        if count <= last_count:
+            stable_rounds += 1
+        else:
+            stable_rounds = 0
+            last_count = count
+
+        # 3 stable iterations seems to work well without excessive waiting.
+        if stable_rounds >= 3:
+            break
+
+
+def _goto_results(page: Page, url: str) -> None:
+    page.goto(url, wait_until="domcontentloaded", timeout=90_000)
+    _handle_consent(page)
+    try:
+        page.wait_for_load_state("networkidle", timeout=30_000)
+    except PlaywrightTimeoutError:
+        pass
+    _handle_consent(page)
+    _wait_for_results(page)
+
+
+def _click_next(page: Page) -> bool:
+    if _click_if_visible(page, ['a[rel="next"]']):
+        return True
+    if _click_if_visible(
+        page,
+        [
+            'a:has-text("Siguiente")',
+            'button:has-text("Siguiente")',
+            '[aria-label*="Siguiente"]',
+            '[data-testid*="pagination-next"]',
+            'li[class*="next"] a',
+        ],
+    ):
+        return True
+    return False
+
+
+def fetch_fotocasa_listings_browser(
+    *,
+    search_url: str,
+    source_name: str = "fotocasa",
+    max_pages: int = 3,
+    config: BrowserConfig,
+) -> list[Listing]:
+    max_pages = max(1, min(int(max_pages), 50))
+
+    ensure_playwright_node_driver_env()
+    with sync_playwright() as p:
+        if config.cdp_endpoint:
+            browser = p.chromium.connect_over_cdp(config.cdp_endpoint)
+            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+
+            _goto_results(page, search_url)
+            if _is_bot_challenge(page):
+                if config.headless:
+                    return []
+                print(
+                    "Fotocasa appears to be showing a bot/captcha challenge. Solve it in the opened browser window, "
+                    "then press Enter here to continue..."
+                )
+                try:
+                    input()
+                except EOFError:
+                    return []
+                _goto_results(page, search_url)
+
+            merged: dict[str, Listing] = {}
+            for _ in range(max_pages):
+                _handle_consent(page)
+                _wait_for_results(page)
+                _scroll_results_until_stable(page)
+                for li in _extract_listings_from_page(page, source_name=source_name):
+                    merged[li.url] = li
+
+                before = page.url
+                if not _click_next(page):
+                    break
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=30_000)
+                except PlaywrightTimeoutError:
+                    pass
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15_000)
+                except PlaywrightTimeoutError:
+                    pass
+                _wait_for_results(page)
+                if page.url == before:
+                    break
+
+            out = list(merged.values())
+            out.sort(key=lambda x: x.url)
+            if not out:
+                debug_dir = Path("data/debug")
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                safe = re.sub(r"[^a-zA-Z0-9_-]+", "_", "fotocasa")[:40]
+                html_path = debug_dir / f"{safe}.html"
+                png_path = debug_dir / f"{safe}.png"
+                try:
+                    html_path.write_text(page.content(), encoding="utf-8")
+                except Exception:
+                    pass
+                try:
+                    page.screenshot(path=str(png_path), full_page=True)
+                except Exception:
+                    pass
+
+            return out
+
+        # Persistent context path (Playwright-managed browser process)
+        launch_kwargs = dict(
+            user_data_dir=config.user_data_dir,
+            headless=config.headless,
+            locale=config.locale,
+            timezone_id=config.timezone_id,
+            viewport={"width": config.viewport[0], "height": config.viewport[1]},
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0.0.0 Safari/537.36"
+            ),
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                f"--profile-directory={config.profile_directory}",
+            ],
+        )
+        if config.executable_path:
+            ctx = p.chromium.launch_persistent_context(
+                **launch_kwargs, executable_path=config.executable_path
+            )
+        else:
+            try:
+                ctx = p.chromium.launch_persistent_context(
+                    **launch_kwargs, channel=config.browser_channel
+                )
+            except Exception:
+                if config.force_browser_channel:
+                    raise
+                ctx = p.chromium.launch_persistent_context(**launch_kwargs)
+
+        try:
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            _goto_results(page, search_url)
+            if _is_bot_challenge(page):
+                if config.headless:
+                    return []
+                print(
+                    "Fotocasa appears to be showing a bot/captcha challenge. Solve it in the opened browser window, "
+                    "then press Enter here to continue..."
+                )
+                try:
+                    input()
+                except EOFError:
+                    return []
+                _goto_results(page, search_url)
+
+            merged: dict[str, Listing] = {}
+            for _ in range(max_pages):
+                _handle_consent(page)
+                _wait_for_results(page)
+                _scroll_results_until_stable(page)
+                for li in _extract_listings_from_page(page, source_name=source_name):
+                    merged[li.url] = li
+
+                before = page.url
+                if not _click_next(page):
+                    break
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=30_000)
+                except PlaywrightTimeoutError:
+                    pass
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15_000)
+                except PlaywrightTimeoutError:
+                    pass
+                _wait_for_results(page)
+                if page.url == before:
+                    break
+
+            out = list(merged.values())
+            out.sort(key=lambda x: x.url)
+            if not out:
+                debug_dir = Path("data/debug")
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                safe = re.sub(r"[^a-zA-Z0-9_-]+", "_", "fotocasa")[:40]
+                html_path = debug_dir / f"{safe}.html"
+                png_path = debug_dir / f"{safe}.png"
+                try:
+                    html_path.write_text(page.content(), encoding="utf-8")
+                except Exception:
+                    pass
+                try:
+                    page.screenshot(path=str(png_path), full_page=True)
+                except Exception:
+                    pass
+            return out
+        finally:
+            ctx.close()
+
