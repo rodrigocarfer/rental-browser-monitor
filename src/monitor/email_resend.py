@@ -15,7 +15,7 @@ def send_listings_resend(*, listings: list[Listing]) -> None:
 
     lines = [f"{li.title}\n  {li.url}" for li in listings]
     body = "New listings:\n\n" + "\n\n".join(lines)
-    subject = f"TESTEEEE: {len(listings)} new listing(s)"
+    subject = f"Rental monitor: {len(listings)} new listing(s)"
 
     r = httpx.post(
         "https://api.resend.com/emails",
