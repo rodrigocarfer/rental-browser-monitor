@@ -47,7 +47,7 @@ def _normalize_yaencontre_url(*, base_url: str, href: str) -> str | None:
     if "/alquiler/" not in pl and "/lloguer/" not in pl:
         return None
 
-    m = re.search(r"/(\d{6,})$", path)
+    m = re.search(r"(?:/|[-_])(\d{6,})$", path)
     if not m:
         return None
 
@@ -192,7 +192,7 @@ def _extract_listings_from_page(page: Page, *, source_name: str) -> list[Listing
 def _wait_for_results(page: Page) -> None:
     try:
         page.wait_for_selector('a[href*="/alquiler/"], a[href*="/lloguer/"]', timeout=25_000)
-    except PlaywrightTimeoutError:
+    except (PlaywrightTimeoutError, Exception):
         pass
 
 
@@ -286,55 +286,63 @@ def fetch_yaencontre_listings_browser(
         if config.cdp_endpoint:
             browser = p.chromium.connect_over_cdp(config.cdp_endpoint)
             ctx = browser.contexts[0] if browser.contexts else browser.new_context()
-            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            page = ctx.new_page()
+            try:
+                _goto_results(page, search_url)
+                if _should_skip_yaencontre_after_challenge(page):
+                    return []
 
-            _goto_results(page, search_url)
-            if _should_skip_yaencontre_after_challenge(page):
+                merged: dict[str, Listing] = {}
+                for _ in range(max_pages):
+                    _handle_consent(page)
+                    _scroll_results_until_stable(page)
+                    for li in _extract_listings_from_page(page, source_name=source_name):
+                        merged[li.url] = li
+
+                    before = page.url
+                    if not _click_next(page):
+                        break
+                    try:
+                        page.wait_for_load_state("domcontentloaded", timeout=30_000)
+                    except PlaywrightTimeoutError:
+                        pass
+                    try:
+                        page.wait_for_load_state("load", timeout=15_000)
+                    except PlaywrightTimeoutError:
+                        pass
+                    try:
+                        page.wait_for_selector('a[href*="/alquiler/"], a[href*="/lloguer/"]', timeout=20_000)
+                    except PlaywrightTimeoutError:
+                        pass
+                    if page.url == before:
+                        break
+
+                out = list(merged.values())
+                out.sort(key=lambda x: x.url)
+                if not out:
+                    debug_dir = Path("data/debug")
+                    debug_dir.mkdir(parents=True, exist_ok=True)
+                    safe = re.sub(r"[^a-zA-Z0-9_-]+", "_", "yaencontre")[:40]
+                    html_path = debug_dir / f"{safe}.html"
+                    png_path = debug_dir / f"{safe}.png"
+                    try:
+                        html_path.write_text(page.content(), encoding="utf-8")
+                    except Exception:
+                        pass
+                    try:
+                        page.screenshot(path=str(png_path), full_page=True)
+                    except Exception:
+                        pass
+
+                return out
+            except Exception as e:
+                print(f"YaEncontre scrape failed, skipping source: {e}", file=sys.stderr)
                 return []
-
-            merged: dict[str, Listing] = {}
-            for _ in range(max_pages):
-                _handle_consent(page)
-                _scroll_results_until_stable(page)
-                for li in _extract_listings_from_page(page, source_name=source_name):
-                    merged[li.url] = li
-
-                before = page.url
-                if not _click_next(page):
-                    break
+            finally:
                 try:
-                    page.wait_for_load_state("domcontentloaded", timeout=30_000)
-                except PlaywrightTimeoutError:
-                    pass
-                try:
-                    page.wait_for_load_state("load", timeout=15_000)
-                except PlaywrightTimeoutError:
-                    pass
-                try:
-                    page.wait_for_selector('a[href*="/alquiler/"], a[href*="/lloguer/"]', timeout=20_000)
-                except PlaywrightTimeoutError:
-                    pass
-                if page.url == before:
-                    break
-
-            out = list(merged.values())
-            out.sort(key=lambda x: x.url)
-            if not out:
-                debug_dir = Path("data/debug")
-                debug_dir.mkdir(parents=True, exist_ok=True)
-                safe = re.sub(r"[^a-zA-Z0-9_-]+", "_", "yaencontre")[:40]
-                html_path = debug_dir / f"{safe}.html"
-                png_path = debug_dir / f"{safe}.png"
-                try:
-                    html_path.write_text(page.content(), encoding="utf-8")
+                    page.close()
                 except Exception:
                     pass
-                try:
-                    page.screenshot(path=str(png_path), full_page=True)
-                except Exception:
-                    pass
-
-            return out
 
         launch_kwargs = dict(
             user_data_dir=config.user_data_dir,
