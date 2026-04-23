@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime
 
 import httpx
 
@@ -15,7 +16,8 @@ def send_listings_resend(*, listings: list[Listing]) -> None:
 
     lines = [f"{li.title}\n  {li.url}" for li in listings]
     body = "New listings:\n\n" + "\n\n".join(lines)
-    subject = f"Rental monitor: {len(listings)} new listing(s)"
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    subject = f"[{timestamp}] Rental monitor: {len(listings)} new listing(s)"
 
     r = httpx.post(
         "https://api.resend.com/emails",
